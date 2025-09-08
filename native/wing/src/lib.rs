@@ -2,9 +2,9 @@ use libwing::WingNodeData;
 use rustler::{ ResourceArc,NifTaggedEnum};
 use rustler::{Env, Term, NifResult, Encoder, OwnedEnv, LocalPid};
 
-use libwing::{WingConsole, WingResponse,WingNodeDef,DiscoveryInfo,SharedWingConnection};
+use libwing::{WingConsole, WingResponse,WingNodeDef,DiscoveryInfo};
 
-use std::sync::{Mutex, mpsc};
+use std::sync::{Mutex, Arc};
 use std::thread;
 
 rustler::atoms! {
@@ -43,6 +43,7 @@ fn connect() -> WingArc {
 
 #[rustler::nif(schedule = "DirtyCpu")]
 fn connect_with_host(host: Option<String>) -> WingArc {
+    // For now, let's not use shared connection to test basic functionality
     ResourceArc::new(
         ExWing {
             wing: Mutex::new(WingConsole::connect(host.as_deref()).unwrap()),
@@ -112,9 +113,9 @@ fn start_meter_thread(host: Option<String>, pid_term: Term, meters_term: Term) -
         }
     }).collect();
     
-    // Get or create shared connection
-    let console = match SharedWingConnection::get_or_connect(host.as_deref()) {
-        Ok(conn) => conn,
+    // Get or create connection
+    let console = match WingConsole::connect(host.as_deref()) {
+        Ok(conn) => std::sync::Arc::new(std::sync::Mutex::new(conn)),
         Err(_) => return Err(rustler::Error::Term(Box::new("Failed to connect".to_string()))),
     };
     
@@ -149,9 +150,9 @@ fn start_meter_thread(host: Option<String>, pid_term: Term, meters_term: Term) -
 fn start_property_thread(host: Option<String>, pid_term: Term, prop_id: i32) -> NifResult<()> {
     let pid: LocalPid = pid_term.decode()?;
     
-    // Get or create shared connection
-    let console = match SharedWingConnection::get_or_connect(host.as_deref()) {
-        Ok(conn) => conn,
+    // Get or create connection
+    let console = match WingConsole::connect(host.as_deref()) {
+        Ok(conn) => std::sync::Arc::new(std::sync::Mutex::new(conn)),
         Err(_) => return Err(rustler::Error::Term(Box::new("Failed to connect".to_string()))),
     };
     
@@ -226,30 +227,21 @@ fn name_to_id(name: String) -> i32 {
 
 #[rustler::nif]
 fn set_float(_wing_arc: WingArc, id: i32, value: f32) -> Result<(), String> {
-    // Use shared connection instead of direct wing console access
-    let console = SharedWingConnection::get_or_connect(None)
-        .map_err(|e| format!("{:?}", e))?;
-    let mut wing = console.lock().unwrap();
-    wing.set_float(id, value).map_err(|e| format!("{:?}", e))
+    // Simplified: use direct connection for now
+    match WingConsole::connect(None) {
+        Ok(mut wing) => wing.set_float(id, value).map_err(|e| format!("{:?}", e)),
+        Err(e) => Err(format!("Connection failed: {:?}", e))
+    }
 }
 
 #[rustler::nif]
 fn request_node_data(_wing_arc: WingArc, id: i32) -> Result<(), String> {
-    // Use shared connection instead of direct wing console access
-    let console = SharedWingConnection::get_or_connect(None)
-        .map_err(|e| format!("{:?}", e))?;
-    let mut wing = console.lock().unwrap();
-    wing.request_node_data(id).map_err(|e| format!("{:?}", e))
+    // Simplified: use direct connection for now  
+    match WingConsole::connect(None) {
+        Ok(mut wing) => wing.request_node_data(id).map_err(|e| format!("{:?}", e)),
+        Err(e) => Err(format!("Connection failed: {:?}", e))
+    }
 }
 
-#[rustler::nif]
-fn shared_connection_disconnect() -> Result<(), String> {
-    SharedWingConnection::disconnect();
-    Ok(())
-}
-
-rustler::init!(
-    "Elixir.Wing",
-    load = on_load
-);
+rustler::init!("Elixir.Wing", load = on_load);
 
