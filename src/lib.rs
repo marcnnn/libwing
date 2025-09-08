@@ -75,10 +75,14 @@ mod console;
 mod node;
 mod ffi;
 mod propmap;
+mod connection_manager;
+mod shared_connection;
 
 pub use console::{WingConsole, DiscoveryInfo, Meter};
 pub use node::{WingNodeDef, WingNodeData, NodeType, NodeUnit};
 pub use ffi::{WingConsoleHandle, ResponseHandle};
+pub use connection_manager::ConnectionManager;
+pub use shared_connection::SharedWingConnection;
 use rustler::NifTaggedEnum;
 
 type Result<T> = std::result::Result<T, Error>;
@@ -95,7 +99,7 @@ pub enum Error {
     DiscoveryError,
 }
 
-#[derive(NifTaggedEnum)]
+#[derive(NifTaggedEnum, Clone)]
 pub enum WingResponse {
     RequestEnd,
     NodeDef(WingNodeDef),

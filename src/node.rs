@@ -250,7 +250,7 @@ impl Clone for WingNodeDef {
     }
 }
 
-#[derive(NifStruct)]
+#[derive(NifStruct, Clone)]
 #[module = "Wing.Node.WingNodeData"]
 pub struct WingNodeData {
     string_value: Option<String>,

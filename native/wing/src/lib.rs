@@ -2,9 +2,10 @@ use libwing::WingNodeData;
 use rustler::{ ResourceArc,NifTaggedEnum};
 use rustler::{Env, Term, NifResult, Encoder, OwnedEnv, LocalPid};
 
-use libwing::{WingConsole, WingResponse,WingNodeDef,DiscoveryInfo};
+use libwing::{WingConsole, WingResponse,WingNodeDef,DiscoveryInfo,SharedWingConnection};
 
-use std::sync::Mutex;
+use std::sync::{Mutex, mpsc};
+use std::thread;
 
 rustler::atoms! {
     channel,
@@ -94,14 +95,14 @@ fn scan() -> Vec<DiscoveryInfo> {
 fn start_meter_thread(host: Option<String>, pid_term: Term, meters_term: Term) -> NifResult<()> {
     let pid: LocalPid = pid_term.decode()?;
     // Accept list of tuples: {atom, integer}
-    let list: Vec<(rustler::types::atom::Atom, u8)> = meters_term.decode()?;
-    let meters: Vec<libwing::Meter> = list.into_iter().map(|(kind, idx)| {
+    let meters: Vec<(rustler::types::atom::Atom, u8)> = meters_term.decode()?;
+    let meters: Vec<libwing::Meter> = meters.into_iter().map(|(kind, idx)| {
         if kind == channel() {
             libwing::Meter::Channel(idx)
         } else if kind == mix() {
             libwing::Meter::Bus(idx)
         } else if kind == aux() {
-            libwing::Meter::Aux(idx)
+            libwing::Meter::Bus(idx)
         } else if kind == main() {
             libwing::Meter::Main(idx)
         } else if kind == matrix() {
@@ -110,65 +111,67 @@ fn start_meter_thread(host: Option<String>, pid_term: Term, meters_term: Term) -
             libwing::Meter::Channel(1)
         }
     }).collect();
-    std::thread::spawn(move || {
-        let mut wing = match libwing::WingConsole::connect(host.as_deref()) {
-            Ok(w) => w,
-            Err(_) => return,
-        };
-        if wing.request_meter(&meters).is_err() {
-            return;
+    
+    // Get or create shared connection
+    let console = match SharedWingConnection::get_or_connect(host.as_deref()) {
+        Ok(conn) => conn,
+        Err(_) => return Err(rustler::Error::Term(Box::new("Failed to connect".to_string()))),
+    };
+    
+    // Start thread to handle meter updates
+    thread::spawn(move || {
+        // Request meter data
+        {
+            let mut wing = console.lock().unwrap();
+            if let Err(_) = wing.request_meter(&meters) {
+                return;
+            }
         }
+        
         loop {
-            if let Ok((_id, values)) = wing.read_meters() {
+            let result = {
+                let mut wing = console.lock().unwrap();
+                wing.read_meters()
+            };
+            
+            if let Ok((_id, values)) = result {
                 let msg: Vec<i32> = values.iter().map(|v| *v as i32).collect();
                 let mut env = OwnedEnv::new();
                 let _ = env.send_and_clear(&pid, |env| (rustler::types::atom::ok(), msg).encode(env));
             }
         }
     });
+    
     Ok(())
 }
 
 #[rustler::nif]
 fn start_property_thread(host: Option<String>, pid_term: Term, prop_id: i32) -> NifResult<()> {
     let pid: LocalPid = pid_term.decode()?;
-    std::thread::spawn(move || {
-        // Add a small delay to avoid overwhelming the console with simultaneous connections
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        
-        let mut wing = None;
-        
-        // Retry connection up to 3 times with increasing delays
-        for attempt in 1..=3 {
-            match libwing::WingConsole::connect(host.as_deref()) {
-                Ok(w) => {
-                    wing = Some(w);
-                    break;
-                }
-                Err(e) => {
-                    eprintln!("Failed to connect for property thread {} (attempt {}): {:?}", prop_id, attempt, e);
-                    if attempt < 3 {
-                        std::thread::sleep(std::time::Duration::from_millis(100 * attempt as u64));
-                    }
-                }
-            }
-        }
-        
-        let mut wing = match wing {
-            Some(w) => w,
-            None => {
-                eprintln!("Failed to connect for property thread {} after 3 attempts", prop_id);
+    
+    // Get or create shared connection
+    let console = match SharedWingConnection::get_or_connect(host.as_deref()) {
+        Ok(conn) => conn,
+        Err(_) => return Err(rustler::Error::Term(Box::new("Failed to connect".to_string()))),
+    };
+    
+    // Start thread to handle property updates
+    thread::spawn(move || {
+        // Request initial data
+        {
+            let mut wing = console.lock().unwrap();
+            if let Err(_) = wing.request_node_data(prop_id) {
                 return;
             }
-        };
-        
-        if let Err(e) = wing.request_node_data(prop_id) {
-            eprintln!("Failed to request node data for property {}: {:?}", prop_id, e);
-            return;
         }
         
         loop {
-            match wing.read() {
+            let response = {
+                let mut wing = console.lock().unwrap();
+                wing.read()
+            };
+            
+            match response {
                 Ok(libwing::WingResponse::NodeData(id, data)) => {
                     if id == prop_id {
                         let mut env = OwnedEnv::new();
@@ -189,23 +192,14 @@ fn start_property_thread(host: Option<String>, pid_term: Term, prop_id: i32) -> 
                     // Node definition, continue reading
                     continue;
                 }
-                Err(e) => {
-                    eprintln!("Error reading from console for property {}: {:?}", prop_id, e);
-                    // Try to reconnect after a delay
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                    wing = match libwing::WingConsole::connect(host.as_deref()) {
-                        Ok(mut w) => {
-                            if let Err(_) = w.request_node_data(prop_id) {
-                                return;
-                            }
-                            w
-                        },
-                        Err(_) => return,
-                    };
+                Err(_) => {
+                    // Connection error, exit thread - the shared connection will handle reconnection
+                    break;
                 }
             }
         }
     });
+    
     Ok(())
 }
 
@@ -231,15 +225,27 @@ fn name_to_id(name: String) -> i32 {
 }
 
 #[rustler::nif]
-fn set_float(wing_arc: WingArc, id: i32, value: f32) -> Result<(), String> {
-    let mut wing = wing_arc.wing.lock().unwrap();
+fn set_float(_wing_arc: WingArc, id: i32, value: f32) -> Result<(), String> {
+    // Use shared connection instead of direct wing console access
+    let console = SharedWingConnection::get_or_connect(None)
+        .map_err(|e| format!("{:?}", e))?;
+    let mut wing = console.lock().unwrap();
     wing.set_float(id, value).map_err(|e| format!("{:?}", e))
 }
 
 #[rustler::nif]
-fn request_node_data(wing_arc: WingArc, id: i32) -> Result<(), String> {
-    let mut wing = wing_arc.wing.lock().unwrap();
+fn request_node_data(_wing_arc: WingArc, id: i32) -> Result<(), String> {
+    // Use shared connection instead of direct wing console access
+    let console = SharedWingConnection::get_or_connect(None)
+        .map_err(|e| format!("{:?}", e))?;
+    let mut wing = console.lock().unwrap();
     wing.request_node_data(id).map_err(|e| format!("{:?}", e))
+}
+
+#[rustler::nif]
+fn shared_connection_disconnect() -> Result<(), String> {
+    SharedWingConnection::disconnect();
+    Ok(())
 }
 
 rustler::init!(

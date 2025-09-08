@@ -11,7 +11,7 @@ use crate::propmap::NAME_TO_DEF;
 use rustler::{NifStruct, NifTaggedEnum};
 
 
-#[derive(NifTaggedEnum)]
+#[derive(NifTaggedEnum, Debug, Clone)]
 pub enum Meter {
     Channel(u8),
     Aux(u8),
