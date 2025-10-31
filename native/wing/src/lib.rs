@@ -42,13 +42,21 @@ fn connect() -> WingArc {
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
-fn connect_with_host(host: Option<String>) -> WingArc {
+fn connect_with_host(host: Option<String>) -> NifResult<WingArc> {
     // For now, let's not use shared connection to test basic functionality
-    ResourceArc::new(
-        ExWing {
-            wing: Mutex::new(WingConsole::connect(host.as_deref()).unwrap()),
+    match WingConsole::connect(host.as_deref()) {
+        Ok(wing_console) => {
+            Ok(ResourceArc::new(
+                ExWing {
+                    wing: Mutex::new(wing_console),
+                }
+            ))
         }
-    )
+        Err(e) => {
+            let error_msg = format!("Failed to connect to Wing console: {:?}", e);
+            Err(rustler::Error::Term(Box::new(error_msg)))
+        }
+    }
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]

@@ -78,6 +78,13 @@ mod propmap;
 mod connection_manager;
 mod shared_connection;
 
+#[cfg(test)]
+mod mock_wing;
+#[cfg(test)]
+mod error_tests;
+#[cfg(test)]
+mod nif_tests;
+
 pub use console::{WingConsole, DiscoveryInfo, Meter};
 pub use node::{WingNodeDef, WingNodeData, NodeType, NodeUnit};
 pub use ffi::{WingConsoleHandle, ResponseHandle};
@@ -99,7 +106,7 @@ pub enum Error {
     DiscoveryError,
 }
 
-#[derive(NifTaggedEnum, Clone)]
+#[derive(NifTaggedEnum, Clone, Debug)]
 pub enum WingResponse {
     RequestEnd,
     NodeDef(WingNodeDef),

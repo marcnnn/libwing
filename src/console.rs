@@ -59,11 +59,13 @@ pub struct DiscoveryInfo {
     pub firmware: String,
 }
 
+#[derive(Debug)]
 pub struct Meters {
     pub socket: UdpSocket,
     pub port: u16,
 }
 
+#[derive(Debug)]
 struct _WingConsoleMain {
     keep_alive_timer:        std::time::Instant,
     rx_buf:                  [u8; RX_BUFFER_SIZE],
@@ -75,13 +77,14 @@ struct _WingConsoleMain {
     current_node_id:         i32,
 }
 
+#[derive(Debug)]
 struct _WingConsoleMeters {
     meters:                  Option<Meters>,
     next_meter_id:           u16,
     keep_alive_meters_timer: std::time::Instant,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct WingConsole {
     rsock: Arc<Mutex<TcpStream>>,
     wsock: Arc<Mutex<TcpStream>>,

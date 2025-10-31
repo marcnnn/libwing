@@ -43,7 +43,7 @@ defmodule Wing.Console do
   """
   @spec subscribe_property(console_ref(), property_id(), subscriber()) :: :ok | {:error, term()}
   def subscribe_property(console, property_id, subscriber \\ self()) do
-    GenServer.call(console, {:subscribe_property, property_id, subscriber})
+    GenServer.call(console, {:subscribe_property, property_id, subscriber}, 15_000)
   end
 
   @doc """
@@ -51,7 +51,7 @@ defmodule Wing.Console do
   """
   @spec unsubscribe_property(console_ref(), property_id(), subscriber()) :: :ok
   def unsubscribe_property(console, property_id, subscriber \\ self()) do
-    GenServer.call(console, {:unsubscribe_property, property_id, subscriber})
+    GenServer.call(console, {:unsubscribe_property, property_id, subscriber}, 15_000)
   end
 
   @doc """
@@ -59,7 +59,7 @@ defmodule Wing.Console do
   """
   @spec subscribe_meters(console_ref(), list(), subscriber()) :: :ok | {:error, term()}
   def subscribe_meters(console, meters, subscriber \\ self()) do
-    GenServer.call(console, {:subscribe_meters, meters, subscriber})
+    GenServer.call(console, {:subscribe_meters, meters, subscriber}, 15_000)
   end
 
   @doc """
@@ -67,7 +67,7 @@ defmodule Wing.Console do
   """
   @spec set_float(console_ref(), property_id(), float()) :: :ok | {:error, term()}
   def set_float(console, property_id, value) do
-    GenServer.call(console, {:set_float, property_id, value})
+    GenServer.call(console, {:set_float, property_id, value}, 15_000)
   end
 
   @doc """
@@ -75,7 +75,7 @@ defmodule Wing.Console do
   """
   @spec get_console_ref(console_ref()) :: reference()
   def get_console_ref(console) do
-    GenServer.call(console, :get_console_ref)
+    GenServer.call(console, :get_console_ref, 15_000)
   end
 
   @doc """
@@ -121,7 +121,7 @@ defmodule Wing.Console do
   """
   @spec reconnect(console_ref()) :: :ok | {:error, term()}
   def reconnect(console) do
-    GenServer.call(console, :reconnect)
+    GenServer.call(console, :reconnect, 15_000)
   end
 
   # GenServer callbacks
@@ -131,19 +131,38 @@ defmodule Wing.Console do
     Process.flag(:trap_exit, true)
 
     # Connect to Wing console
-    console_ref = Wing.connect_with_host(host)
+    case Wing.connect_with_host(host) do
+      {:ok, console_ref} ->
+        state = %{
+          console_ref: console_ref,
+          host: host,
+          property_subscriptions: %{},
+          meter_subscriptions: [],
+          property_threads: MapSet.new(),
+          meter_thread_started: false,
+          monitored_pids: %{}
+        }
 
-    state = %{
-      console_ref: console_ref,
-      host: host,
-      property_subscriptions: %{},
-      meter_subscriptions: [],
-      property_threads: MapSet.new(),
-      meter_thread_started: false,
-      monitored_pids: %{}
-    }
+        {:ok, state}
 
-    {:ok, state}
+      {:error, reason} ->
+        IO.puts("Failed to connect to Wing console at #{host}: #{reason}")
+        {:stop, {:shutdown, {:connection_failed, reason}}}
+      
+      # Handle direct reference return (current NIF behavior)
+      console_ref when is_reference(console_ref) ->
+        state = %{
+          console_ref: console_ref,
+          host: host,
+          property_subscriptions: %{},
+          meter_subscriptions: [],
+          property_threads: MapSet.new(),
+          meter_thread_started: false,
+          monitored_pids: %{}
+        }
+
+        {:ok, state}
+    end
   end
 
   @impl true

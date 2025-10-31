@@ -30,20 +30,20 @@ pub enum NodeUnit {
     Seconds = 6,
     Octaves = 7,
 }
-#[derive(NifStruct)]
+#[derive(NifStruct, Debug)]
 #[module = "Wing.Node.StringEnumItem"]
 pub struct StringEnumItem {
     pub item: String,
     pub long_item: String,
 }
 
-#[derive(NifStruct)]
+#[derive(NifStruct, Debug)]
 #[module = "Wing.Node.FloatEnumItem"]
 pub struct FloatEnumItem {
     pub item: f32,
     pub long_item: String,
 }
-#[derive(NifStruct)]
+#[derive(NifStruct, Debug)]
 #[module = "Wing.Node.WingNodeDef"]
 pub struct WingNodeDef {
     pub id: i32,
@@ -250,7 +250,7 @@ impl Clone for WingNodeDef {
     }
 }
 
-#[derive(NifStruct, Clone)]
+#[derive(NifStruct, Clone, Debug)]
 #[module = "Wing.Node.WingNodeData"]
 pub struct WingNodeData {
     string_value: Option<String>,
