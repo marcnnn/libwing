@@ -176,14 +176,14 @@ defmodule Wing.Console do
     new_subs = [subscriber | current_subs] |> Enum.uniq()
     property_subscriptions = Map.put(state.property_subscriptions, property_id, new_subs)
 
-    # Start the unified property thread on first subscription
+    # Start unified thread on first subscription, then just request data for each new property
     new_state =
       if state.property_thread_started do
         # Thread already running, just request current value for this property
         _ = Wing.request_node_data(state.console_ref, property_id)
         %{state | property_subscriptions: property_subscriptions, monitored_pids: monitored_pids}
       else
-        # Start the unified property monitoring thread
+        # Start the unified property monitoring thread once
         case Wing.start_unified_property_thread(state.console_ref, self()) do
           result when result in [:ok, {}, {:ok, {}}] ->
             Logger.info("Started unified property monitoring thread")
@@ -198,7 +198,7 @@ defmodule Wing.Console do
 
           error ->
             Logger.error("Failed to start unified property thread: #{inspect(error)}")
-            # Still add subscription in case a retry succeeds later
+            # Don't mark as started so next subscription will retry
             %{state | property_subscriptions: property_subscriptions, monitored_pids: monitored_pids}
         end
       end

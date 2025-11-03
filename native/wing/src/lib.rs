@@ -180,7 +180,7 @@ fn start_meter_thread_arc(wing_arc: WingArc, pid_term: Term, meters_term: Term) 
     Ok(())
 }
 
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyCpu")]
 fn start_unified_property_thread(wing_arc: WingArc, pid_term: Term) -> NifResult<()> {
     let pid: LocalPid = pid_term.decode()?;
     
@@ -188,15 +188,36 @@ fn start_unified_property_thread(wing_arc: WingArc, pid_term: Term) -> NifResult
     let console = wing_arc.clone();
     
     // Start a single thread to handle ALL property updates
+    // This spawns immediately and returns, so it won't block the NIF
     thread::spawn(move || {
         let mut consecutive_errors = 0;
         let max_errors = 10;
         
+        // Small initial delay to ensure request_node_data has been called
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        
         loop {
+            // Lock mutex, read response, THEN unlock before processing
+            // This prevents holding the mutex during blocking operations
             let response = {
-                console.wing.lock()
-                    .ok()
-                    .and_then(|mut wing| wing.read().ok())
+                let mut wing_guard = match console.wing.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        consecutive_errors += 1;
+                        if consecutive_errors >= max_errors {
+                            let mut env = OwnedEnv::new();
+                            let msg = (rustler::types::atom::error(), "mutex_poisoned");
+                            let _ = env.send_and_clear(&pid, |env| msg.encode(env));
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        continue;
+                    }
+                };
+                
+                // Read with mutex held (this is the blocking part)
+                wing_guard.read().ok()
+                // Mutex is automatically released here when wing_guard goes out of scope
             };
             
             match response {
