@@ -104,6 +104,8 @@ pub enum Error {
     ConnectionError,
     #[error("Failed to discover Wing console")]
     DiscoveryError,
+    #[error("Connection timeout")]
+    ConnectionTimeout,
 }
 
 #[derive(NifTaggedEnum, Clone, Debug)]

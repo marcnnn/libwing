@@ -57,7 +57,8 @@ impl ConnectionManager {
 
     /// Connect to a Wing console
     pub fn connect(&self, host: &str) -> Result<()> {
-        let mut instance = self.instance.lock().unwrap();
+        let mut instance = self.instance.lock()
+            .map_err(|_| crate::Error::ConnectionError)?;
         
         // Disconnect existing connection if any
         if let Some(mut inner) = instance.take() {
@@ -94,18 +95,20 @@ impl ConnectionManager {
 
     /// Disconnect from the Wing console
     pub fn disconnect(&self) {
-        let mut instance = self.instance.lock().unwrap();
-        if let Some(mut inner) = instance.take() {
-            let _ = inner.command_sender.send(ConnectionMessage::Disconnect);
-            if let Some(handle) = inner.thread_handle.take() {
-                let _ = handle.join();
+        if let Ok(mut instance) = self.instance.lock() {
+            if let Some(mut inner) = instance.take() {
+                let _ = inner.command_sender.send(ConnectionMessage::Disconnect);
+                if let Some(handle) = inner.thread_handle.take() {
+                    let _ = handle.join();
+                }
             }
         }
     }
 
     /// Send a command to the Wing console
     pub fn send_command(&self, command: ConnectionMessage) -> Result<()> {
-        let instance = self.instance.lock().unwrap();
+        let instance = self.instance.lock()
+            .map_err(|_| crate::Error::ConnectionError)?;
         if let Some(inner) = instance.as_ref() {
             inner.command_sender.send(command)
                 .map_err(|_| crate::Error::ConnectionError)?;
@@ -160,14 +163,16 @@ impl ConnectionManager {
 
     /// Check if connected
     pub fn is_connected(&self) -> bool {
-        let instance = self.instance.lock().unwrap();
-        instance.is_some()
+        self.instance.lock()
+            .map(|instance| instance.is_some())
+            .unwrap_or(false)
     }
 
     /// Get the current host
     pub fn get_host(&self) -> Option<String> {
-        let instance = self.instance.lock().unwrap();
-        instance.as_ref().map(|inner| inner.host.clone())
+        self.instance.lock()
+            .ok()
+            .and_then(|instance| instance.as_ref().map(|inner| inner.host.clone()))
     }
 
     /// Main communication loop that runs in a separate thread

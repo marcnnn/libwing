@@ -183,7 +183,7 @@ defmodule Wing.Console do
         _ = Wing.request_node_data(state.console_ref, property_id)
         %{state | property_subscriptions: property_subscriptions, monitored_pids: monitored_pids}
       else
-        case Wing.start_property_thread(state.host, self(), property_id) do
+        case Wing.start_property_thread_arc(state.console_ref, self(), property_id) do
           result when result in [:ok, {}, {:ok, {}}] ->
             Logger.debug("Started property thread for #{property_id}")
             # Immediately request current value so subscribers get a baseline notification
@@ -230,7 +230,7 @@ defmodule Wing.Console do
         |> Enum.flat_map(fn {_sub, meters} -> meters end)
         |> Enum.uniq()
 
-      case Wing.start_meter_thread(state.host, self(), all_meters) do
+      case Wing.start_meter_thread_arc(state.console_ref, self(), all_meters) do
         result when result in [:ok, {}, {:ok, {}}] ->
           %{state | meter_thread_started: true, meter_subscriptions: meter_subscriptions, monitored_pids: monitored_pids}
         error ->
@@ -264,8 +264,8 @@ defmodule Wing.Console do
   def handle_call(:reconnect, _from, state) do
     Logger.info("Reconnecting console to #{state.host}")
 
-    # Clean up old console reference
-    old_ref = state.console_ref
+    # Clean up old console reference (could be used for cleanup in the future)
+    _old_ref = state.console_ref
 
     try do
       # Connect to Wing console with the same host

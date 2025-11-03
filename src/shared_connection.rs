@@ -13,7 +13,8 @@ impl SharedWingConnection {
     /// Get or create the shared connection
     pub fn get_or_connect(host: Option<&str>) -> Result<Arc<Mutex<WingConsole>>, crate::Error> {
         let instance = SHARED_CONNECTION.get_or_init(|| Mutex::new(None));
-        let mut guard = instance.lock().unwrap();
+        let mut guard = instance.lock()
+            .map_err(|_| crate::Error::ConnectionError)?;
         
         match guard.as_ref() {
             Some(conn) => {
@@ -26,7 +27,9 @@ impl SharedWingConnection {
                             console: Arc::new(Mutex::new(console)),
                             host: h.to_string(),
                         });
-                        return Ok(guard.as_ref().unwrap().console.clone());
+                        return Ok(guard.as_ref()
+                            .ok_or(crate::Error::ConnectionError)?
+                            .console.clone());
                     }
                 } 
                 // Return existing connection
@@ -56,8 +59,9 @@ impl SharedWingConnection {
     /// Clear the shared connection (for disconnection)
     pub fn disconnect() {
         if let Some(instance) = SHARED_CONNECTION.get() {
-            let mut guard = instance.lock().unwrap();
-            *guard = None;
+            if let Ok(mut guard) = instance.lock() {
+                *guard = None;
+            }
         }
     }
 }
