@@ -368,14 +368,14 @@ fn name_to_id(name: String) -> i32 {
     libwing::WingConsole::name_to_id(&name).unwrap_or(-1)
 }
 
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyCpu")]
 fn set_float(wing_arc: WingArc, id: i32, value: f32) -> Result<(), String> {
     let mut wing = wing_arc.wing.lock()
         .map_err(|_| "Failed to lock wing mutex".to_string())?;
     wing.set_float(id, value).map_err(|e| format!("{:?}", e))
 }
 
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyCpu")]
 fn request_node_data(wing_arc: WingArc, id: i32) -> Result<(), String> {
     let mut wing = wing_arc.wing.lock()
         .map_err(|_| "Failed to lock wing mutex".to_string())?;
