@@ -131,6 +131,9 @@ fn start_meter_thread_arc(wing_arc: WingArc, pid_term: Term, meters_term: Term) 
     
     // Start thread to handle meter updates
     thread::spawn(move || {
+        let mut consecutive_errors = 0;
+        let max_errors = 10;
+        
         // Request meter data
         {
             if let Ok(mut wing) = console.wing.lock() {
@@ -150,12 +153,96 @@ fn start_meter_thread_arc(wing_arc: WingArc, pid_term: Term, meters_term: Term) 
             };
             
             if let Some((_id, values)) = result {
+                consecutive_errors = 0; // Reset error counter on success
+                
                 let msg: Vec<i32> = values.iter().map(|v| *v as i32).collect();
                 let mut env = OwnedEnv::new();
                 let _ = env.send_and_clear(&pid, |env| (rustler::types::atom::ok(), msg).encode(env));
+                
+                // Small delay to prevent hammering when many meter updates arrive
+                // Meters update frequently, so use a very short delay
+                std::thread::sleep(std::time::Duration::from_micros(500));
             } else {
-                // Failed to read, wait before retrying
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                // Failed to read, exponential backoff
+                consecutive_errors += 1;
+                
+                if consecutive_errors >= max_errors {
+                    // Too many consecutive errors, give up
+                    return;
+                }
+                
+                let delay_ms = std::cmp::min(100 * consecutive_errors, 1000);
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            }
+        }
+    });
+    
+    Ok(())
+}
+
+#[rustler::nif]
+fn start_unified_property_thread(wing_arc: WingArc, pid_term: Term) -> NifResult<()> {
+    let pid: LocalPid = pid_term.decode()?;
+    
+    // Clone the shared connection resource
+    let console = wing_arc.clone();
+    
+    // Start a single thread to handle ALL property updates
+    thread::spawn(move || {
+        let mut consecutive_errors = 0;
+        let max_errors = 10;
+        
+        loop {
+            let response = {
+                console.wing.lock()
+                    .ok()
+                    .and_then(|mut wing| wing.read().ok())
+            };
+            
+            match response {
+                Some(libwing::WingResponse::NodeData(id, data)) => {
+                    consecutive_errors = 0; // Reset error counter on success
+                    
+                    // Send all property updates to the GenServer
+                    // GenServer will filter and dispatch to appropriate subscribers
+                    let mut env = OwnedEnv::new();
+                    let float_value = data.get_float();
+                    let msg = (
+                        rustler::types::atom::ok(),
+                        id,
+                        float_value
+                    );
+                    let _ = env.send_and_clear(&pid, |env| msg.encode(env));
+                    
+                    // Small delay to prevent overwhelming the GenServer
+                    std::thread::sleep(std::time::Duration::from_micros(100));
+                }
+                Some(libwing::WingResponse::RequestEnd) => {
+                    // Request end, small delay before continuing
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Some(libwing::WingResponse::NodeDef(_)) => {
+                    // Node definition, small delay before continuing
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                None => {
+                    // Connection error, exponential backoff
+                    consecutive_errors += 1;
+                    
+                    if consecutive_errors >= max_errors {
+                        // Too many errors, notify GenServer and exit
+                        let mut env = OwnedEnv::new();
+                        let msg = (
+                            rustler::types::atom::error(),
+                            "connection_lost"
+                        );
+                        let _ = env.send_and_clear(&pid, |env| msg.encode(env));
+                        return;
+                    }
+                    
+                    let delay_ms = std::cmp::min(100 * consecutive_errors, 1000);
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                }
             }
         }
     });
@@ -172,6 +259,9 @@ fn start_property_thread_arc(wing_arc: WingArc, pid_term: Term, prop_id: i32) ->
     
     // Start thread to handle property updates
     thread::spawn(move || {
+        let mut consecutive_errors = 0;
+        let max_errors = 10;
+        
         // Request initial data
         {
             if let Ok(mut wing) = console.wing.lock() {
@@ -192,6 +282,8 @@ fn start_property_thread_arc(wing_arc: WingArc, pid_term: Term, prop_id: i32) ->
             
             match response {
                 Some(libwing::WingResponse::NodeData(id, data)) => {
+                    consecutive_errors = 0; // Reset error counter on success
+                    
                     if id == prop_id {
                         let mut env = OwnedEnv::new();
                         let float_value = data.get_float();
@@ -202,18 +294,30 @@ fn start_property_thread_arc(wing_arc: WingArc, pid_term: Term, prop_id: i32) ->
                         );
                         let _ = env.send_and_clear(&pid, |env| msg.encode(env));
                     }
+                    // Small delay to prevent hammering the mutex when many messages arrive
+                    std::thread::sleep(std::time::Duration::from_micros(100));
                 }
                 Some(libwing::WingResponse::RequestEnd) => {
-                    // Request end, continue reading
+                    // Request end, small delay before continuing
+                    std::thread::sleep(std::time::Duration::from_millis(1));
                     continue;
                 }
                 Some(libwing::WingResponse::NodeDef(_)) => {
-                    // Node definition, continue reading
+                    // Node definition, small delay before continuing
+                    std::thread::sleep(std::time::Duration::from_millis(1));
                     continue;
                 }
                 None => {
-                    // Connection error, wait before retrying
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    // Connection error, exponential backoff
+                    consecutive_errors += 1;
+                    
+                    if consecutive_errors >= max_errors {
+                        // Too many errors, give up
+                        return;
+                    }
+                    
+                    let delay_ms = std::cmp::min(100 * consecutive_errors, 1000);
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                 }
             }
         }

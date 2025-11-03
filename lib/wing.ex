@@ -11,6 +11,7 @@ defmodule Wing do
   # Arc-based thread NIFs (used by Wing.Console)
   def start_meter_thread_arc(_wing_arc, _pid, _meters), do: :erlang.nif_error(:nif_not_loaded)
   def start_property_thread_arc(_wing_arc, _pid, _prop_id), do: :erlang.nif_error(:nif_not_loaded)
+  def start_unified_property_thread(_wing_arc, _pid), do: :erlang.nif_error(:nif_not_loaded)
   
   # Utility NIFs
   def name_to_id(_name), do: :erlang.nif_error(:nif_not_loaded)

@@ -138,7 +138,7 @@ defmodule Wing.Console do
           host: host,
           property_subscriptions: %{},
           meter_subscriptions: [],
-          property_threads: MapSet.new(),
+          property_thread_started: false,
           meter_thread_started: false,
           monitored_pids: %{}
         }
@@ -156,7 +156,7 @@ defmodule Wing.Console do
           host: host,
           property_subscriptions: %{},
           meter_subscriptions: [],
-          property_threads: MapSet.new(),
+          property_thread_started: false,
           meter_thread_started: false,
           monitored_pids: %{}
         }
@@ -176,22 +176,29 @@ defmodule Wing.Console do
     new_subs = [subscriber | current_subs] |> Enum.uniq()
     property_subscriptions = Map.put(state.property_subscriptions, property_id, new_subs)
 
-    # Start a property thread for each distinct property id (idempotent-ish)
+    # Start the unified property thread on first subscription
     new_state =
-      if MapSet.member?(state.property_threads, property_id) do
-        # Already have a thread; re-request current value to prompt notification
+      if state.property_thread_started do
+        # Thread already running, just request current value for this property
         _ = Wing.request_node_data(state.console_ref, property_id)
         %{state | property_subscriptions: property_subscriptions, monitored_pids: monitored_pids}
       else
-        case Wing.start_property_thread_arc(state.console_ref, self(), property_id) do
+        # Start the unified property monitoring thread
+        case Wing.start_unified_property_thread(state.console_ref, self()) do
           result when result in [:ok, {}, {:ok, {}}] ->
-            Logger.debug("Started property thread for #{property_id}")
-            # Immediately request current value so subscribers get a baseline notification
+            Logger.info("Started unified property monitoring thread")
+            # Request current value for this property
             _ = Wing.request_node_data(state.console_ref, property_id)
-            %{state | property_threads: MapSet.put(state.property_threads, property_id), property_subscriptions: property_subscriptions, monitored_pids: monitored_pids}
+            %{
+              state
+              | property_thread_started: true,
+                property_subscriptions: property_subscriptions,
+                monitored_pids: monitored_pids
+            }
+
           error ->
-            # If starting a thread fails, still add subscription so a later retry might work
-            Logger.debug("Failed to start property thread for #{property_id}: #{inspect(error)}")
+            Logger.error("Failed to start unified property thread: #{inspect(error)}")
+            # Still add subscription in case a retry succeeds later
             %{state | property_subscriptions: property_subscriptions, monitored_pids: monitored_pids}
         end
       end
