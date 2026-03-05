@@ -187,23 +187,26 @@ impl ConnectionManager {
         
         thread::spawn(move || {
             let mut wing = wing_clone;
+            let mut consecutive_errors: u32 = 0;
             loop {
                 match wing.read() {
                     Ok(response) => {
+                        consecutive_errors = 0;
                         if response_sender.send(response).is_err() {
                             break;
                         }
                     }
                     Err(_) => {
-                        // Connection lost, try to reconnect
-                        thread::sleep(Duration::from_millis(1000));
+                        // Connection lost, try to reconnect with exponential backoff
+                        let backoff = std::cmp::min(1000 * 2u64.saturating_pow(consecutive_errors), 30_000);
+                        consecutive_errors = consecutive_errors.saturating_add(1);
+                        thread::sleep(Duration::from_millis(backoff));
                         match WingConsole::connect(Some(&host_clone1)) {
                             Ok(new_wing) => {
                                 wing = new_wing;
+                                consecutive_errors = 0;
                             }
-                            Err(_) => {
-                                thread::sleep(Duration::from_millis(5000));
-                            }
+                            Err(_) => {}
                         }
                     }
                 }
@@ -217,23 +220,26 @@ impl ConnectionManager {
         
         thread::spawn(move || {
             let mut wing = wing_clone2;
+            let mut consecutive_errors: u32 = 0;
             loop {
                 match wing.read_meters() {
                     Ok((id, data)) => {
+                        consecutive_errors = 0;
                         if meter_sender.send((id, data)).is_err() {
                             break;
                         }
                     }
                     Err(_) => {
-                        // Connection lost, try to reconnect  
-                        thread::sleep(Duration::from_millis(1000));
+                        // Connection lost, try to reconnect with exponential backoff
+                        let backoff = std::cmp::min(1000 * 2u64.saturating_pow(consecutive_errors), 30_000);
+                        consecutive_errors = consecutive_errors.saturating_add(1);
+                        thread::sleep(Duration::from_millis(backoff));
                         match WingConsole::connect(Some(&host_clone2)) {
                             Ok(new_wing) => {
                                 wing = new_wing;
+                                consecutive_errors = 0;
                             }
-                            Err(_) => {
-                                thread::sleep(Duration::from_millis(5000));
-                            }
+                            Err(_) => {}
                         }
                     }
                 }

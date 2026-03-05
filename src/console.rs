@@ -145,6 +145,14 @@ impl WingConsole {
         let mut stream = TcpStream::connect((ip, 2222))?;
         // stream.set_nonblocking(true)?;
         stream.set_nodelay(true)?;
+
+        // Enable TCP keepalive to detect half-open connections during long-running sessions
+        let socket = socket2::SockRef::from(&stream);
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(30))
+            .with_interval(Duration::from_secs(10));
+        let _ = socket.set_tcp_keepalive(&keepalive);
+
         stream.write_all(&[0xdf, 0xd1])?;
 
         Ok(Self {
@@ -343,7 +351,8 @@ impl WingConsole {
         loop {
             self._keep_alive(r)?;
             if r.rx_buf_size == 0 {
-                self.rsock.clone().lock().unwrap().set_read_timeout(Some(r.keep_alive_timer.duration_since(std::time::Instant::now())))?;
+                let timeout = r.keep_alive_timer.checked_duration_since(std::time::Instant::now()).unwrap_or(Duration::from_millis(100));
+                self.rsock.clone().lock().unwrap().set_read_timeout(Some(timeout))?;
                 match self.rsock.clone().lock().unwrap().read(&mut r.rx_buf) {
                     Ok(n) if n > 0 => {
                         // println!("got n {}...", n);
@@ -557,7 +566,8 @@ impl WingConsole {
             self._keep_alive_meters(&mut m)?;
             let md = m.meters.as_ref().unwrap();
             let mut buf = [0u8; 8192];
-            md.socket.set_read_timeout(Some(m.keep_alive_meters_timer.duration_since(std::time::Instant::now())))?;
+            let timeout = m.keep_alive_meters_timer.checked_duration_since(std::time::Instant::now()).unwrap_or(Duration::from_millis(100));
+            md.socket.set_read_timeout(Some(timeout))?;
             match md.socket.recv_from(&mut buf) {
                 Ok((received, _addr)) => {
                     return Ok((u16::from_be_bytes([buf[0], buf[1]]), buf[4..received]

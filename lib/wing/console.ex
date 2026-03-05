@@ -20,6 +20,9 @@ defmodule Wing.Console do
   @type property_id :: integer()
   @type subscriber :: pid()
 
+  # Health check interval: verify connection is alive every 60 seconds
+  @health_check_interval_ms 60_000
+
   # Client API
 
   @doc """
@@ -90,12 +93,14 @@ defmodule Wing.Console do
   Execute a function with automatic reconnection on broken pipe errors.
   This is a global wrapper that can be used for any Wing operation.
   """
+  @reconnectable_errors ["Broken pipe", "Connection reset", "ConnectionError", "connection refused", "Transport endpoint", "timed out"]
+
   @spec with_reconnection(console_ref(), function()) :: term()
   def with_reconnection(console, operation_fn) do
     case operation_fn.() do
       {:error, {:error, error_msg}} when is_binary(error_msg) ->
-        if String.contains?(error_msg, "Broken pipe") do
-          Logger.warning("Broken pipe detected, attempting reconnection")
+        if Enum.any?(@reconnectable_errors, &String.contains?(error_msg, &1)) do
+          Logger.warning("Connection error detected (#{error_msg}), attempting reconnection")
           case reconnect(console) do
             :ok ->
               Logger.info("Reconnection successful, retrying operation")
@@ -133,6 +138,9 @@ defmodule Wing.Console do
     # Connect to Wing console
     console_ref = Wing.connect_with_host(host)
 
+    # Schedule periodic health check
+    Process.send_after(self(), :health_check, @health_check_interval_ms)
+
     state = %{
       console_ref: console_ref,
       host: host,
@@ -140,7 +148,9 @@ defmodule Wing.Console do
       meter_subscriptions: [],
       property_threads: MapSet.new(),
       meter_thread_started: false,
-      monitored_pids: %{}
+      monitored_pids: %{},
+      last_property_update: System.monotonic_time(:millisecond),
+      last_meter_update: System.monotonic_time(:millisecond)
     }
 
     {:ok, state}
@@ -272,7 +282,7 @@ defmodule Wing.Console do
     # Don't send directly to subscribers - let the Fader/Preamp managers handle translation
 
     # Send to Fader and Preamp managers for message translation
-  Logger.debug("Wing.Console property update id=#{property_id} value=#{inspect(value)}")
+    Logger.debug("Wing.Console property update id=#{property_id} value=#{inspect(value)}")
     if Process.whereis(Wing.Fader) do
       send(Wing.Fader, {:property_changed, property_id, value})
     end
@@ -287,7 +297,7 @@ defmodule Wing.Console do
       subs -> Enum.each(subs, fn pid -> send(pid, {:ok, property_id, value}) end)
     end
 
-    {:noreply, state}
+    {:noreply, %{state | last_property_update: System.monotonic_time(:millisecond)}}
   end
 
   @impl true
@@ -297,7 +307,49 @@ defmodule Wing.Console do
       send(subscriber, {:meters_updated, meter_values})
     end
 
+    {:noreply, %{state | last_meter_update: System.monotonic_time(:millisecond)}}
+  end
+
+  @impl true
+  def handle_info({:error, "meter_thread_connection_lost"}, state) do
+    Logger.warning("Wing.Console: meter thread lost connection, it will attempt to reconnect automatically")
     {:noreply, state}
+  end
+
+  @impl true
+  def handle_info({:error, "property_thread_connection_lost", prop_id}, state) do
+    Logger.warning("Wing.Console: property thread for #{prop_id} lost connection, it will attempt to reconnect automatically")
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_info(:health_check, state) do
+    # Schedule next health check
+    Process.send_after(self(), :health_check, @health_check_interval_ms)
+
+    now = System.monotonic_time(:millisecond)
+
+    # Check if property threads are still sending updates (if we have subscriptions)
+    if map_size(state.property_subscriptions) > 0 do
+      silence_ms = now - state.last_property_update
+      if silence_ms > 120_000 do
+        Logger.warning("Wing.Console: no property updates for #{div(silence_ms, 1000)}s, attempting reconnection")
+        try do
+          new_console_ref = Wing.connect_with_host(state.host)
+          # Re-request data for all subscribed properties to trigger fresh updates
+          for {prop_id, _subs} <- state.property_subscriptions do
+            _ = Wing.request_node_data(new_console_ref, prop_id)
+          end
+          {:noreply, %{state | console_ref: new_console_ref, last_property_update: now}}
+        rescue
+          _ -> {:noreply, state}
+        end
+      else
+        {:noreply, state}
+      end
+    else
+      {:noreply, state}
+    end
   end
 
   @impl true
