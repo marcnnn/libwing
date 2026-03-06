@@ -4,7 +4,7 @@ use rustler::{Env, Term, NifResult, Encoder, OwnedEnv, LocalPid};
 
 use libwing::{WingConsole, WingResponse,WingNodeDef,DiscoveryInfo};
 
-use std::sync::{Mutex, Arc};
+use std::sync::Mutex;
 use std::thread;
 
 rustler::atoms! {
@@ -112,95 +112,169 @@ fn start_meter_thread(host: Option<String>, pid_term: Term, meters_term: Term) -
             libwing::Meter::Channel(1)
         }
     }).collect();
-    
+
     // Get or create connection
     let console = match WingConsole::connect(host.as_deref()) {
-        Ok(conn) => std::sync::Arc::new(std::sync::Mutex::new(conn)),
+        Ok(conn) => conn,
         Err(_) => return Err(rustler::Error::Term(Box::new("Failed to connect".to_string()))),
     };
-    
-    // Start thread to handle meter updates
+
+    // Start thread to handle meter updates with reconnection logic
     thread::spawn(move || {
-        // Request meter data
-        {
-            let mut wing = console.lock().unwrap();
-            if let Err(_) = wing.request_meter(&meters) {
-                return;
-            }
-        }
-        
+        let mut wing = console;
+        let host_str = host;
+        let mut consecutive_errors: u32 = 0;
+        const MAX_BACKOFF_MS: u64 = 30_000;
+
         loop {
-            let result = {
-                let mut wing = console.lock().unwrap();
-                wing.read_meters()
-            };
-            
-            if let Ok((_id, values)) = result {
-                let msg: Vec<i32> = values.iter().map(|v| *v as i32).collect();
-                let mut env = OwnedEnv::new();
-                let _ = env.send_and_clear(&pid, |env| (rustler::types::atom::ok(), msg).encode(env));
+            // (Re-)request meter data after connect/reconnect
+            match wing.request_meter(&meters) {
+                Ok(_) => { consecutive_errors = 0; }
+                Err(_) => {
+                    // Notify GenServer of connection trouble
+                    let mut env = OwnedEnv::new();
+                    let _ = env.send_and_clear(&pid, |env| {
+                        (rustler::types::atom::error(), "meter_thread_connection_lost").encode(env)
+                    });
+
+                    let backoff = std::cmp::min(1000 * 2u64.saturating_pow(consecutive_errors), MAX_BACKOFF_MS);
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                    thread::sleep(std::time::Duration::from_millis(backoff));
+
+                    // Try to reconnect
+                    match WingConsole::connect(host_str.as_deref()) {
+                        Ok(new_wing) => { wing = new_wing; }
+                        Err(_) => {}
+                    }
+                    continue;
+                }
+            }
+
+            // Read meter data in a loop
+            loop {
+                match wing.read_meters() {
+                    Ok((_id, values)) => {
+                        consecutive_errors = 0;
+                        let msg: Vec<i32> = values.iter().map(|v| *v as i32).collect();
+                        let mut env = OwnedEnv::new();
+                        if env.send_and_clear(&pid, |env| (rustler::types::atom::ok(), msg).encode(env)).is_err() {
+                            // GenServer process is dead, exit thread
+                            return;
+                        }
+                    }
+                    Err(_) => {
+                        // Connection lost - notify GenServer and attempt reconnection
+                        let mut env = OwnedEnv::new();
+                        let _ = env.send_and_clear(&pid, |env| {
+                            (rustler::types::atom::error(), "meter_thread_connection_lost").encode(env)
+                        });
+
+                        let backoff = std::cmp::min(1000 * 2u64.saturating_pow(consecutive_errors), MAX_BACKOFF_MS);
+                        consecutive_errors = consecutive_errors.saturating_add(1);
+                        thread::sleep(std::time::Duration::from_millis(backoff));
+
+                        match WingConsole::connect(host_str.as_deref()) {
+                            Ok(new_wing) => { wing = new_wing; }
+                            Err(_) => {}
+                        }
+                        break; // Break inner loop to re-request meters on new connection
+                    }
+                }
             }
         }
     });
-    
+
     Ok(())
 }
 
 #[rustler::nif]
 fn start_property_thread(host: Option<String>, pid_term: Term, prop_id: i32) -> NifResult<()> {
     let pid: LocalPid = pid_term.decode()?;
-    
+
     // Get or create connection
     let console = match WingConsole::connect(host.as_deref()) {
-        Ok(conn) => std::sync::Arc::new(std::sync::Mutex::new(conn)),
+        Ok(conn) => conn,
         Err(_) => return Err(rustler::Error::Term(Box::new("Failed to connect".to_string()))),
     };
-    
-    // Start thread to handle property updates
+
+    // Start thread to handle property updates with reconnection logic
     thread::spawn(move || {
-        // Request initial data
-        {
-            let mut wing = console.lock().unwrap();
-            if let Err(_) = wing.request_node_data(prop_id) {
-                return;
-            }
-        }
-        
+        let mut wing = console;
+        let host_str = host;
+        let mut consecutive_errors: u32 = 0;
+        const MAX_BACKOFF_MS: u64 = 30_000;
+
         loop {
-            let response = {
-                let mut wing = console.lock().unwrap();
-                wing.read()
-            };
-            
-            match response {
-                Ok(libwing::WingResponse::NodeData(id, data)) => {
-                    if id == prop_id {
-                        let mut env = OwnedEnv::new();
-                        let float_value = data.get_float();
-                        let msg = (
-                            rustler::types::atom::ok(),
-                            id,
-                            float_value
-                        );
-                        let _ = env.send_and_clear(&pid, |env| msg.encode(env));
-                    }
-                }
-                Ok(libwing::WingResponse::RequestEnd) => {
-                    // Request end, continue reading
-                    continue;
-                }
-                Ok(libwing::WingResponse::NodeDef(_)) => {
-                    // Node definition, continue reading
-                    continue;
-                }
+            // (Re-)request initial data after connect/reconnect
+            match wing.request_node_data(prop_id) {
+                Ok(_) => { consecutive_errors = 0; }
                 Err(_) => {
-                    // Connection error, exit thread - the shared connection will handle reconnection
-                    break;
+                    let mut env = OwnedEnv::new();
+                    let _ = env.send_and_clear(&pid, |env| {
+                        (rustler::types::atom::error(), "property_thread_connection_lost", prop_id).encode(env)
+                    });
+
+                    let backoff = std::cmp::min(1000 * 2u64.saturating_pow(consecutive_errors), MAX_BACKOFF_MS);
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                    thread::sleep(std::time::Duration::from_millis(backoff));
+
+                    match WingConsole::connect(host_str.as_deref()) {
+                        Ok(new_wing) => { wing = new_wing; }
+                        Err(_) => {}
+                    }
+                    continue;
+                }
+            }
+
+            // Read property updates
+            loop {
+                match wing.read() {
+                    Ok(libwing::WingResponse::NodeData(id, data)) => {
+                        consecutive_errors = 0;
+                        if id == prop_id {
+                            let mut env = OwnedEnv::new();
+                            let float_value = data.get_float();
+                            let msg = (
+                                rustler::types::atom::ok(),
+                                id,
+                                float_value
+                            );
+                            if env.send_and_clear(&pid, |env| msg.encode(env)).is_err() {
+                                // GenServer process is dead, exit thread
+                                return;
+                            }
+                        }
+                    }
+                    Ok(libwing::WingResponse::RequestEnd) => {
+                        consecutive_errors = 0;
+                        continue;
+                    }
+                    Ok(libwing::WingResponse::NodeDef(_)) => {
+                        consecutive_errors = 0;
+                        continue;
+                    }
+                    Err(_) => {
+                        // Connection lost - notify GenServer and attempt reconnection
+                        let mut env = OwnedEnv::new();
+                        let _ = env.send_and_clear(&pid, |env| {
+                            (rustler::types::atom::error(), "property_thread_connection_lost", prop_id).encode(env)
+                        });
+
+                        let backoff = std::cmp::min(1000 * 2u64.saturating_pow(consecutive_errors), MAX_BACKOFF_MS);
+                        consecutive_errors = consecutive_errors.saturating_add(1);
+                        thread::sleep(std::time::Duration::from_millis(backoff));
+
+                        match WingConsole::connect(host_str.as_deref()) {
+                            Ok(new_wing) => { wing = new_wing; }
+                            Err(_) => {}
+                        }
+                        break; // Break inner loop to re-request data on new connection
+                    }
                 }
             }
         }
     });
-    
+
     Ok(())
 }
 
