@@ -284,6 +284,16 @@ impl WingConsole {
         Ok(f32::from_bits(val))
     }
 
+    /// Shut down the underlying TCP connection. A thread blocked in read()
+    /// wakes up with an error immediately. Safe to call from any clone of
+    /// this console and more than once; goes through wsock because the
+    /// reader side holds the rsock lock while blocked in read().
+    /// (rsock and wsock are clones of the same socket, so this closes both.)
+    pub fn shutdown(&self) -> Result<()> {
+        self.wsock.lock().unwrap().shutdown(std::net::Shutdown::Both)?;
+        Ok(())
+    }
+
     /// read() will call this as needed, but if you don't call read() then the Wing Console will
     /// hang up the connection after a 10 seconds of no activity. You should call this yourself
     /// periodically if you are not calling read().

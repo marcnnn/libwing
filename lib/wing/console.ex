@@ -4,13 +4,21 @@ end
 
 defmodule Wing.Console do
   @moduledoc """
-  GenServer that manages a Wing console connection with centralized property and meter threads.
+  GenServer that manages a Wing console connection.
 
-  This module provides:
-  - Single property thread per console for all property subscriptions
-  - Single meter thread per console for all meter subscriptions
-  - Automatic cleanup and resource management
-  - Message routing to subscribers
+  One console process owns:
+  - a single TCP connection to the console (the NIF resource)
+  - a single reader thread sharing that same connection, forwarding every
+    property update to this process, which routes them to subscribers
+
+  Property subscriptions are therefore free: subscribing adds an entry to a
+  routing table — no extra threads, no extra TCP connections (the Wing only
+  allows a couple of simultaneous connections).
+
+  When the connection dies, the reader thread reports it; this process sends
+  `{:wing_connection_lost, reason}` to every subscriber and stops with
+  `{:shutdown, :connection_lost}`, so an owner that links or monitors gets a
+  prompt, unambiguous signal.
   """
 
   use GenServer
@@ -40,6 +48,8 @@ defmodule Wing.Console do
 
   @doc """
   Subscribe to property changes for a specific property ID.
+  The subscriber receives `{:ok, property_id, value}` messages on changes and
+  `{:wing_connection_lost, reason}` if the console connection dies.
   """
   @spec subscribe_property(console_ref(), property_id(), subscriber()) :: :ok | {:error, term()}
   def subscribe_property(console, property_id, subscriber \\ self()) do
@@ -79,7 +89,7 @@ defmodule Wing.Console do
   end
 
   @doc """
-  Stop the console GenServer.
+  Stop the console GenServer (closes the connection and reader thread).
   """
   @spec stop(console_ref()) :: :ok
   def stop(console) do
@@ -96,14 +106,12 @@ defmodule Wing.Console do
       {:error, {:error, error_msg}} when is_binary(error_msg) ->
         if String.contains?(error_msg, "Broken pipe") do
           Logger.warning("Broken pipe detected, attempting reconnection")
+
           case reconnect(console) do
             :ok ->
               Logger.info("Reconnection successful, retrying operation")
-              case operation_fn.() do
-                success_result ->
-                  Logger.info("Operation succeeded after reconnection")
-                  success_result
-              end
+              operation_fn.()
+
             {:error, reason} ->
               Logger.error("Reconnection failed: #{inspect(reason)}")
               {:error, {:error, error_msg}}
@@ -111,13 +119,14 @@ defmodule Wing.Console do
         else
           {:error, {:error, error_msg}}
         end
+
       other_result ->
         other_result
     end
   end
 
   @doc """
-  Reconnect the console to its host.
+  Reconnect the console to its host, keeping all subscriptions.
   """
   @spec reconnect(console_ref()) :: :ok | {:error, term()}
   def reconnect(console) do
@@ -130,54 +139,45 @@ defmodule Wing.Console do
   def init(host) do
     Process.flag(:trap_exit, true)
 
-    # Connect to Wing console
-    console_ref = Wing.connect_with_host(host)
+    case Wing.connect_with_host(host) do
+      {:ok, console_ref} ->
+        reader_handle = Wing.start_reader_thread(console_ref, self())
 
-    state = %{
-      console_ref: console_ref,
-      host: host,
-      property_subscriptions: %{},
-      meter_subscriptions: [],
-      property_threads: MapSet.new(),
-      meter_thread_started: false,
-      monitored_pids: %{}
-    }
+        state = %{
+          console_ref: console_ref,
+          reader_handle: reader_handle,
+          host: host,
+          property_subscriptions: %{},
+          meter_subscriptions: [],
+          meter_thread_started: false,
+          monitored_pids: %{}
+        }
 
-    {:ok, state}
+        {:ok, state}
+
+      {:error, reason} ->
+        {:stop, {:connection_failed, reason}}
+    end
   end
 
   @impl true
   def handle_call({:subscribe_property, property_id, subscriber}, _from, state) do
-    # Monitor the subscriber process
+    # Monitor the subscriber process so its subscriptions are cleaned up
     ref = Process.monitor(subscriber)
     monitored_pids = Map.put(state.monitored_pids, ref, subscriber)
 
-    # Add subscription
     current_subs = Map.get(state.property_subscriptions, property_id, [])
     new_subs = [subscriber | current_subs] |> Enum.uniq()
     property_subscriptions = Map.put(state.property_subscriptions, property_id, new_subs)
 
-    # Start a property thread for each distinct property id (idempotent-ish)
-    new_state =
-      if MapSet.member?(state.property_threads, property_id) do
-        # Already have a thread; re-request current value to prompt notification
-        _ = Wing.request_node_data(state.console_ref, property_id)
-        %{state | property_subscriptions: property_subscriptions, monitored_pids: monitored_pids}
-      else
-        case Wing.start_property_thread(state.host, self(), property_id) do
-          result when result in [:ok, {}, {:ok, {}}] ->
-            Logger.debug("Started property thread for #{property_id}")
-            # Immediately request current value so subscribers get a baseline notification
-            _ = Wing.request_node_data(state.console_ref, property_id)
-            %{state | property_threads: MapSet.put(state.property_threads, property_id), property_subscriptions: property_subscriptions, monitored_pids: monitored_pids}
-          error ->
-            # If starting a thread fails, still add subscription so a later retry might work
-            Logger.debug("Failed to start property thread for #{property_id}: #{inspect(error)}")
-            %{state | property_subscriptions: property_subscriptions, monitored_pids: monitored_pids}
-        end
-      end
+    # No thread to start: the single reader thread already sees every property
+    # update on this connection; subscribing only adds a routing entry.
+    # Request the node's data so a current value (if the console reports one)
+    # reaches new subscribers promptly.
+    _ = Wing.request_node_data(state.console_ref, property_id)
 
-    {:reply, :ok, new_state}
+    {:reply, :ok,
+     %{state | property_subscriptions: property_subscriptions, monitored_pids: monitored_pids}}
   end
 
   @impl true
@@ -185,14 +185,14 @@ defmodule Wing.Console do
     current_subs = Map.get(state.property_subscriptions, property_id, [])
     new_subs = Enum.reject(current_subs, &(&1 == subscriber))
 
-    property_subscriptions = if Enum.empty?(new_subs) do
-      Map.delete(state.property_subscriptions, property_id)
-    else
-      Map.put(state.property_subscriptions, property_id, new_subs)
-    end
+    property_subscriptions =
+      if Enum.empty?(new_subs) do
+        Map.delete(state.property_subscriptions, property_id)
+      else
+        Map.put(state.property_subscriptions, property_id, new_subs)
+      end
 
-    new_state = %{state | property_subscriptions: property_subscriptions}
-    {:reply, :ok, new_state}
+    {:reply, :ok, %{state | property_subscriptions: property_subscriptions}}
   end
 
   @impl true
@@ -204,27 +204,30 @@ defmodule Wing.Console do
     # Add meter subscription
     meter_subscriptions = [{subscriber, meters} | state.meter_subscriptions] |> Enum.uniq()
 
-    # Start meter thread if not already started
-    new_state = if not state.meter_thread_started do
+    if state.meter_thread_started do
+      {:reply, :ok,
+       %{state | meter_subscriptions: meter_subscriptions, monitored_pids: monitored_pids}}
+    else
       # Collect all unique meters from all subscriptions
-      all_meters = meter_subscriptions
+      all_meters =
+        meter_subscriptions
         |> Enum.flat_map(fn {_sub, meters} -> meters end)
         |> Enum.uniq()
 
       case Wing.start_meter_thread(state.host, self(), all_meters) do
         result when result in [:ok, {}, {:ok, {}}] ->
-          %{state | meter_thread_started: true, meter_subscriptions: meter_subscriptions, monitored_pids: monitored_pids}
+          {:reply, :ok,
+           %{
+             state
+             | meter_thread_started: true,
+               meter_subscriptions: meter_subscriptions,
+               monitored_pids: monitored_pids
+           }}
+
         error ->
           Process.demonitor(ref, [:flush])
           {:reply, {:error, error}, state}
       end
-    else
-      %{state | meter_subscriptions: meter_subscriptions, monitored_pids: monitored_pids}
-    end
-
-    case new_state do
-      %{} -> {:reply, :ok, new_state}
-      {:reply, error, state} -> {:reply, error, state}
     end
   end
 
@@ -245,34 +248,35 @@ defmodule Wing.Console do
   def handle_call(:reconnect, _from, state) do
     Logger.info("Reconnecting console to #{state.host}")
 
-    # Clean up old console reference
-    old_ref = state.console_ref
+    # Tear down the old reader thread and connection first — the Wing only
+    # has a couple of connection slots, so the old one must be closed before
+    # a new one is opened.
+    if state.reader_handle, do: Wing.stop_reader_thread(state.reader_handle)
 
-    try do
-      # Connect to Wing console with the same host
-      new_console_ref = Wing.connect_with_host(state.host)
+    case Wing.connect_with_host(state.host) do
+      {:ok, new_console_ref} ->
+        new_reader = Wing.start_reader_thread(new_console_ref, self())
 
-      Logger.info("Successfully reconnected to Wing console at #{state.host}")
-      new_state = %{state | console_ref: new_console_ref}
-      {:reply, :ok, new_state}
-    rescue
-      error ->
-        Logger.error("Failed to reconnect to Wing console: #{inspect(error)}")
-        {:reply, {:error, error}, state}
-    catch
-      kind, reason ->
-        Logger.error("Reconnection failed with #{kind}: #{inspect(reason)}")
+        # Re-request data for all subscribed properties on the new connection
+        Enum.each(Map.keys(state.property_subscriptions), fn prop_id ->
+          _ = Wing.request_node_data(new_console_ref, prop_id)
+        end)
+
+        Logger.info("Successfully reconnected to Wing console at #{state.host}")
+        {:reply, :ok, %{state | console_ref: new_console_ref, reader_handle: new_reader}}
+
+      {:error, reason} ->
+        Logger.error("Failed to reconnect to Wing console: #{inspect(reason)}")
         {:reply, {:error, reason}, state}
     end
   end
 
   @impl true
-  def handle_info({:ok, property_id, value}, state) do
-    # Property update from property thread
-    # Don't send directly to subscribers - let the Fader/Preamp managers handle translation
+  def handle_info({:wing_reader_data, property_id, value}, state) do
+    # Property update from the reader thread. The reader forwards every
+    # NodeData on the connection; only subscribed ids are routed onward.
+    Logger.debug("Wing.Console property update id=#{property_id} value=#{inspect(value)}")
 
-    # Send to Fader and Preamp managers for message translation
-  Logger.debug("Wing.Console property update id=#{property_id} value=#{inspect(value)}")
     if Process.whereis(Wing.Fader) do
       send(Wing.Fader, {:property_changed, property_id, value})
     end
@@ -281,7 +285,6 @@ defmodule Wing.Console do
       send(Wing.Preamp, {:property_changed, property_id, value})
     end
 
-    # Also dispatch to any direct subscribers (raw subscription use-case)
     case Map.get(state.property_subscriptions, property_id) do
       nil -> :ok
       subs -> Enum.each(subs, fn pid -> send(pid, {:ok, property_id, value}) end)
@@ -291,7 +294,22 @@ defmodule Wing.Console do
   end
 
   @impl true
-  def handle_info({:ok, meter_values}, state) do
+  def handle_info({:wing_reader_error, reason}, state) do
+    Logger.warning("Wing console connection lost: #{inspect(reason)}")
+
+    # Tell every subscriber explicitly, then stop. Owners that link/monitor
+    # this process additionally see the {:shutdown, :connection_lost} exit.
+    state.property_subscriptions
+    |> Enum.flat_map(fn {_prop_id, subs} -> subs end)
+    |> Kernel.++(Enum.map(state.meter_subscriptions, fn {sub, _meters} -> sub end))
+    |> Enum.uniq()
+    |> Enum.each(fn pid -> send(pid, {:wing_connection_lost, reason}) end)
+
+    {:stop, {:shutdown, :connection_lost}, state}
+  end
+
+  @impl true
+  def handle_info({:ok, meter_values}, state) when is_list(meter_values) do
     # Meter update from meter thread
     for {subscriber, _meters} <- state.meter_subscriptions do
       send(subscriber, {:meters_updated, meter_values})
@@ -307,7 +325,8 @@ defmodule Wing.Console do
 
     if subscriber do
       # Remove from property subscriptions
-      property_subscriptions = state.property_subscriptions
+      property_subscriptions =
+        state.property_subscriptions
         |> Enum.map(fn {prop_id, subs} ->
           {prop_id, Enum.reject(subs, &(&1 == subscriber))}
         end)
@@ -315,17 +334,18 @@ defmodule Wing.Console do
         |> Map.new()
 
       # Remove from meter subscriptions
-      meter_subscriptions = Enum.reject(state.meter_subscriptions, fn {sub, _meters} ->
-        sub == subscriber
-      end)
+      meter_subscriptions =
+        Enum.reject(state.meter_subscriptions, fn {sub, _meters} ->
+          sub == subscriber
+        end)
 
-      new_state = %{state |
-        property_subscriptions: property_subscriptions,
-        meter_subscriptions: meter_subscriptions,
-        monitored_pids: monitored_pids
-      }
-
-      {:noreply, new_state}
+      {:noreply,
+       %{
+         state
+         | property_subscriptions: property_subscriptions,
+           meter_subscriptions: meter_subscriptions,
+           monitored_pids: monitored_pids
+       }}
     else
       {:noreply, state}
     end
@@ -338,8 +358,11 @@ defmodule Wing.Console do
   end
 
   @impl true
-  def terminate(_reason, _state) do
-    # Cleanup happens automatically when process dies
+  def terminate(_reason, state) do
+    # Stop the reader thread and close the TCP connection deterministically —
+    # relying on NIF resource GC would keep a Wing connection slot occupied
+    # for an unbounded time.
+    if state.reader_handle, do: Wing.stop_reader_thread(state.reader_handle)
     :ok
   end
 end
