@@ -81,6 +81,10 @@ struct _WingConsoleMain {
 struct _WingConsoleMeters {
     meters:                  Option<Meters>,
     next_meter_id:           u16,
+    /// Meter ids that are still wanted. The Wing drops a meter subscription
+    /// after a few seconds without a keep-alive, so an id removed from here
+    /// stops streaming on its own (see stop_meter()).
+    active_meter_ids:        Vec<u16>,
     keep_alive_meters_timer: std::time::Instant,
 }
 
@@ -171,6 +175,7 @@ impl WingConsole {
                 keep_alive_meters_timer: std::time::Instant::now() + std::time::Duration::from_secs(METERS_KEEP_ALIVE_SECONDS),
                 meters: None,
                 next_meter_id: 0,
+                active_meter_ids: Vec::new(),
             })),
         })
     }
@@ -327,21 +332,20 @@ impl WingConsole {
     fn _keep_alive_meters(&mut self, m: &mut _WingConsoleMeters) -> Result<()> {
         if m.keep_alive_meters_timer <= std::time::Instant::now() {
             // println!("keep_alive_meters");
-            let meters = m.meters.as_ref().unwrap();
-            let mut keepalive = [
-                0xdf, 0xd3, 0xd4,
-                0x00,
-                0x00,
-                ((meters.port >> 8) & 0xff) as u8,
-                (meters.port & 0xff) as u8,
-                0xdf, 0xd1
-            ];
-            let mut i = m.next_meter_id as i32;
-            while i > 0 {
-                keepalive[3] = ((i >> 8) & 0xff) as u8;
-                keepalive[4] = (i & 0xff) as u8;
-                self.wsock.clone().lock().unwrap().write_all(&keepalive)?;
-                i -= 1;
+            if let Some(meters) = m.meters.as_ref() {
+                let mut keepalive = [
+                    0xdf, 0xd3, 0xd4,
+                    0x00,
+                    0x00,
+                    ((meters.port >> 8) & 0xff) as u8,
+                    (meters.port & 0xff) as u8,
+                    0xdf, 0xd1
+                ];
+                for id in m.active_meter_ids.iter() {
+                    keepalive[3] = ((id >> 8) & 0xff) as u8;
+                    keepalive[4] = (id & 0xff) as u8;
+                    self.wsock.clone().lock().unwrap().write_all(&keepalive)?;
+                }
             }
             m.keep_alive_meters_timer = std::time::Instant::now() + std::time::Duration::from_secs(METERS_KEEP_ALIVE_SECONDS);
         }
@@ -464,6 +468,8 @@ impl WingConsole {
         let mtrsptr = self.mtrs.clone();
         let mut mtrs = mtrsptr.lock().unwrap();
         mtrs.next_meter_id += 1;
+        let meter_id = mtrs.next_meter_id;
+        mtrs.active_meter_ids.push(meter_id);
 
         if mtrs.meters.is_none() {
             let socket = UdpSocket::bind("0.0.0.0:0")?;
@@ -481,8 +487,8 @@ impl WingConsole {
             ((md.port >> 8) & 0xff) as u8,
             (md.port & 0xff) as u8,
             0xd4,
-            ((mtrs.next_meter_id >> 8) & 0xff) as u8,
-            (mtrs.next_meter_id & 0xff) as u8,
+            ((meter_id >> 8) & 0xff) as u8,
+            (meter_id & 0xff) as u8,
             ((md.port >> 8) & 0xff) as u8,
             (md.port & 0xff) as u8,
             0xdc,
@@ -561,29 +567,62 @@ impl WingConsole {
 
         self.wsock.clone().lock().unwrap().write_all(&buf)?;
 
-        Ok(mtrs.next_meter_id)
+        Ok(meter_id)
+    }
+
+    /// Stops keeping the given meter id (from request_meter()) alive. The Wing
+    /// drops the subscription a few seconds later and stops sending its UDP
+    /// packets; until then read_meters() may still return values for that id.
+    pub fn stop_meter(&mut self, id: u16) {
+        let mtrsptr = self.mtrs.clone();
+        let mut mtrs = mtrsptr.lock().unwrap();
+        mtrs.active_meter_ids.retain(|i| *i != id);
     }
 
     /// reads any meter values that have been requested with request_meter() and returns the meter
     /// ID along with the meters values
     pub fn read_meters(&mut self) -> Result<(u16, Vec<i16>)> {
         loop {
+            if let Some(meters) = self.read_meters_timeout(Duration::from_secs(1))? {
+                return Ok(meters);
+            }
+        }
+    }
+
+    /// Like read_meters(), but gives up after `timeout` and returns Ok(None)
+    /// instead of blocking until data (or a hard error) shows up. Use this in
+    /// a thread that has to notice a shutdown request: meter keep-alives are
+    /// still sent while waiting, so the subscription stays alive.
+    pub fn read_meters_timeout(&mut self, timeout: Duration) -> Result<Option<(u16, Vec<i16>)>> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
             let mptr = self.mtrs.clone();
             let mut m = mptr.lock().unwrap();
 
             self._keep_alive_meters(&mut m)?;
-            let md = m.meters.as_ref().unwrap();
+
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            // A read timeout of zero means "block forever", so never let the
+            // remaining wait round down to it.
+            let wait = std::cmp::min(m.keep_alive_meters_timer, deadline)
+                .duration_since(now)
+                .max(Duration::from_millis(1));
+
+            let md = m.meters.as_ref().ok_or(Error::ConnectionError)?;
             let mut buf = [0u8; 8192];
-            md.socket.set_read_timeout(Some(m.keep_alive_meters_timer.duration_since(std::time::Instant::now())))?;
+            md.socket.set_read_timeout(Some(wait))?;
             match md.socket.recv_from(&mut buf) {
                 Ok((received, _addr)) => {
-                    return Ok((u16::from_be_bytes([buf[0], buf[1]]), buf[4..received]
+                    return Ok(Some((u16::from_be_bytes([buf[0], buf[1]]), buf[4..received]
                             .chunks_exact(2) // Take 2 bytes at a time
                             .map(|chunk| i16::from_be_bytes([chunk[0], chunk[1]]))
-                            .collect()));
+                            .collect())));
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(10));
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
+                           || e.kind() == std::io::ErrorKind::TimedOut => {
                     continue;
                 }
                 Err(_) => {
@@ -680,8 +719,15 @@ impl WingConsole {
 }
 
 impl Drop for WingConsole {
+    /// A WingConsole is a cheap handle on one connection (everything behind it
+    /// is Arc'd and shared with its clones), so the socket may only be closed
+    /// by the LAST handle. Closing on every drop hung up on all other users —
+    /// a worker thread ending was enough to kill the connection.
     fn drop(&mut self) {
-        let _ = self.wsock.clone().lock().unwrap().shutdown(std::net::Shutdown::Both);
-        let _ = self.rsock.clone().lock().unwrap().shutdown(std::net::Shutdown::Both);
+        if Arc::strong_count(&self.wsock) > 1 {
+            return;
+        }
+        let _ = self.wsock.lock().unwrap().shutdown(std::net::Shutdown::Both);
+        let _ = self.rsock.lock().unwrap().shutdown(std::net::Shutdown::Both);
     }
 }

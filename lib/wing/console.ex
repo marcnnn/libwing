@@ -15,6 +15,11 @@ defmodule Wing.Console do
   routing table — no extra threads, no extra TCP connections (the Wing only
   allows a couple of simultaneous connections).
 
+  Meters work the same way: at most one meter thread per console, sharing the
+  same connection. It runs only while someone is subscribed and always requests
+  the union of every subscriber's meters. See `subscribe_meters/3` for the
+  message format.
+
   When the connection dies, the reader thread reports it; this process sends
   `{:wing_connection_lost, reason}` to every subscriber and stops with
   `{:shutdown, :connection_lost}`, so an owner that links or monitors gets a
@@ -65,11 +70,36 @@ defmodule Wing.Console do
   end
 
   @doc """
-  Subscribe to meter updates.
+  Subscribe to meter updates for the given meters, e.g. `[{:channel, 1}, {:main, 1}]`.
+
+  Subscribers receive, at roughly 21 Hz:
+
+      {:meters_updated, %{meters: [{:channel, 1}, {:main, 1}], values: [...]}}
+
+  `values` is one flat list of integers for the *merged* meter set of all
+  current subscribers — that merged set is what `meters` names, in request
+  order, which is why it is sent along: it is the only way to tell which value
+  belongs to which meter. Each meter contributes 8 values, so meter `n` (zero
+  based) in `meters` owns `Enum.slice(values, n * 8, 8)`. Values are dB * 256
+  (divide by 256 for dB); -32768 means -inf (silence).
+
+  Subscribing while the meter thread already runs is fine: if the subscription
+  adds meters, the merged set is re-requested and every subscriber sees the
+  wider payload from then on. Subscribers are monitored; when the last one goes
+  away the meter thread stops.
   """
   @spec subscribe_meters(console_ref(), list(), subscriber()) :: :ok | {:error, term()}
   def subscribe_meters(console, meters, subscriber \\ self()) do
     GenServer.call(console, {:subscribe_meters, meters, subscriber})
+  end
+
+  @doc """
+  Stop receiving meter updates. Stops the meter thread if this was the last
+  meter subscriber.
+  """
+  @spec unsubscribe_meters(console_ref(), subscriber()) :: :ok
+  def unsubscribe_meters(console, subscriber \\ self()) do
+    GenServer.call(console, {:unsubscribe_meters, subscriber})
   end
 
   @doc """
@@ -149,7 +179,8 @@ defmodule Wing.Console do
           host: host,
           property_subscriptions: %{},
           meter_subscriptions: [],
-          meter_thread_started: false,
+          meter_handle: nil,
+          meter_set: [],
           monitored_pids: %{}
         }
 
@@ -204,31 +235,25 @@ defmodule Wing.Console do
     # Add meter subscription
     meter_subscriptions = [{subscriber, meters} | state.meter_subscriptions] |> Enum.uniq()
 
-    if state.meter_thread_started do
-      {:reply, :ok,
-       %{state | meter_subscriptions: meter_subscriptions, monitored_pids: monitored_pids}}
-    else
-      # Collect all unique meters from all subscriptions
-      all_meters =
-        meter_subscriptions
-        |> Enum.flat_map(fn {_sub, meters} -> meters end)
-        |> Enum.uniq()
+    # Starting the thread or widening its meter set both happen here, so a
+    # subscription that arrives after the thread is running is not ignored.
+    case sync_meter_thread(%{state | meter_subscriptions: meter_subscriptions}) do
+      {:ok, state} ->
+        {:reply, :ok, %{state | monitored_pids: monitored_pids}}
 
-      case Wing.start_meter_thread(state.host, self(), all_meters) do
-        result when result in [:ok, {}, {:ok, {}}] ->
-          {:reply, :ok,
-           %{
-             state
-             | meter_thread_started: true,
-               meter_subscriptions: meter_subscriptions,
-               monitored_pids: monitored_pids
-           }}
-
-        error ->
-          Process.demonitor(ref, [:flush])
-          {:reply, {:error, error}, state}
-      end
+      {:error, reason} ->
+        Process.demonitor(ref, [:flush])
+        {:reply, {:error, reason}, state}
     end
+  end
+
+  @impl true
+  def handle_call({:unsubscribe_meters, subscriber}, _from, state) do
+    meter_subscriptions =
+      Enum.reject(state.meter_subscriptions, fn {sub, _} -> sub == subscriber end)
+
+    {_, state} = sync_meter_thread(%{state | meter_subscriptions: meter_subscriptions})
+    {:reply, :ok, state}
   end
 
   @impl true
@@ -252,6 +277,8 @@ defmodule Wing.Console do
     # has a couple of connection slots, so the old one must be closed before
     # a new one is opened.
     if state.reader_handle, do: Wing.stop_reader_thread(state.reader_handle)
+    # The meter thread rides on the old connection too, so it has to go with it.
+    if state.meter_handle, do: Wing.stop_meter_thread(state.meter_handle)
 
     case Wing.connect_with_host(state.host) do
       {:ok, new_console_ref} ->
@@ -261,6 +288,15 @@ defmodule Wing.Console do
         Enum.each(Map.keys(state.property_subscriptions), fn prop_id ->
           _ = Wing.request_node_data(new_console_ref, prop_id)
         end)
+
+        # Same for meters: the merged set is re-requested on the new connection.
+        {_, state} =
+          sync_meter_thread(%{
+            state
+            | console_ref: new_console_ref,
+              meter_handle: nil,
+              meter_set: []
+          })
 
         Logger.info("Successfully reconnected to Wing console at #{state.host}")
         {:reply, :ok, %{state | console_ref: new_console_ref, reader_handle: new_reader}}
@@ -309,10 +345,14 @@ defmodule Wing.Console do
   end
 
   @impl true
-  def handle_info({:ok, meter_values}, state) when is_list(meter_values) do
-    # Meter update from meter thread
+  def handle_info({:wing_meter_data, values}, state) when is_list(values) do
+    # Meter frame from the meter thread. Every subscriber gets the whole merged
+    # payload plus the meter set it belongs to (see subscribe_meters/3) — the
+    # values carry no labels of their own.
+    payload = %{meters: state.meter_set, values: values}
+
     for {subscriber, _meters} <- state.meter_subscriptions do
-      send(subscriber, {:meters_updated, meter_values})
+      send(subscriber, {:meters_updated, payload})
     end
 
     {:noreply, state}
@@ -339,13 +379,17 @@ defmodule Wing.Console do
           sub == subscriber
         end)
 
-      {:noreply,
-       %{
-         state
-         | property_subscriptions: property_subscriptions,
-           meter_subscriptions: meter_subscriptions,
-           monitored_pids: monitored_pids
-       }}
+      # Narrows the meter set, or stops the meter thread if that was the last
+      # meter subscriber.
+      {_, state} =
+        sync_meter_thread(%{
+          state
+          | property_subscriptions: property_subscriptions,
+            meter_subscriptions: meter_subscriptions,
+            monitored_pids: monitored_pids
+        })
+
+      {:noreply, state}
     else
       {:noreply, state}
     end
@@ -359,10 +403,49 @@ defmodule Wing.Console do
 
   @impl true
   def terminate(_reason, state) do
-    # Stop the reader thread and close the TCP connection deterministically —
+    # Stop both threads and close the TCP connection deterministically —
     # relying on NIF resource GC would keep a Wing connection slot occupied
     # for an unbounded time.
+    if state.meter_handle, do: Wing.stop_meter_thread(state.meter_handle)
     if state.reader_handle, do: Wing.stop_reader_thread(state.reader_handle)
     :ok
+  end
+
+  # Single place that owns the meter thread: keeps it running with exactly the
+  # union of all current subscriptions' meters, and not running at all when
+  # nobody is subscribed.
+  #
+  # Subscriptions are kept newest-first, so reversing gives subscription order:
+  # meters keep their position in the merged set when later subscribers add to
+  # it, and the indices existing subscribers computed stay valid.
+  defp sync_meter_thread(state) do
+    merged =
+      state.meter_subscriptions
+      |> Enum.reverse()
+      |> Enum.flat_map(fn {_sub, meters} -> meters end)
+      |> Enum.uniq()
+
+    cond do
+      merged == state.meter_set ->
+        {:ok, state}
+
+      merged == [] ->
+        Wing.stop_meter_thread(state.meter_handle)
+        {:ok, %{state | meter_handle: nil, meter_set: []}}
+
+      state.meter_handle != nil ->
+        Wing.update_meter_thread(state.meter_handle, merged)
+        {:ok, %{state | meter_set: merged}}
+
+      true ->
+        try do
+          handle = Wing.start_meter_thread(state.console_ref, self(), merged)
+          {:ok, %{state | meter_handle: handle, meter_set: merged}}
+        rescue
+          e ->
+            Logger.error("Failed to start Wing meter thread: #{inspect(e)}")
+            {:error, e}
+        end
+    end
   end
 end

@@ -7,6 +7,7 @@ use libwing::{WingConsole, WingResponse,WingNodeDef,DiscoveryInfo};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::time::Duration;
 
 rustler::atoms! {
     channel,
@@ -15,7 +16,8 @@ rustler::atoms! {
     main,
     matrix,
     wing_reader_data,
-    wing_reader_error
+    wing_reader_error,
+    wing_meter_data
 }
 
 struct ExWing { pub wing: Mutex<WingConsole> }
@@ -32,6 +34,17 @@ struct ReaderHandle {
 
 type ReaderArc = ResourceArc<ReaderHandle>;
 
+/// Handle for a per-console meter thread. Holds the stop flag the thread
+/// polls, a console clone (the SAME connection — meters do not need one of
+/// their own) and the meter set a subscriber change wants requested next.
+struct MeterHandle {
+    stop: AtomicBool,
+    wing: WingConsole,
+    pending: Mutex<Option<Vec<libwing::Meter>>>,
+}
+
+type MeterArc = ResourceArc<MeterHandle>;
+
 #[derive(NifTaggedEnum)]
 pub enum WingResponseSimple {
     RequestEnd,
@@ -43,6 +56,7 @@ pub enum WingResponseSimple {
 fn on_load(env: Env, _info: Term) -> bool {
     let _ = rustler::resource!(ExWing, env);
     let _ = rustler::resource!(ReaderHandle, env);
+    let _ = rustler::resource!(MeterHandle, env);
     true
 }
 
@@ -181,12 +195,10 @@ fn stop_reader_thread(handle: ReaderArc) -> rustler::types::atom::Atom {
     rustler::types::atom::ok()
 }
 
-#[rustler::nif]
-fn start_meter_thread(host: Option<String>, pid_term: Term, meters_term: Term) -> NifResult<()> {
-    let pid: LocalPid = pid_term.decode()?;
+fn decode_meters(meters_term: Term) -> NifResult<Vec<libwing::Meter>> {
     // Accept list of tuples: {atom, integer}
     let meters: Vec<(rustler::types::atom::Atom, u8)> = meters_term.decode()?;
-    let meters: Vec<libwing::Meter> = meters.into_iter().map(|(kind, idx)| {
+    Ok(meters.into_iter().map(|(kind, idx)| {
         if kind == channel() {
             libwing::Meter::Channel(idx)
         } else if kind == mix() {
@@ -200,39 +212,113 @@ fn start_meter_thread(host: Option<String>, pid_term: Term, meters_term: Term) -
         } else {
             libwing::Meter::Channel(1)
         }
-    }).collect();
+    }).collect())
+}
 
-    // Get or create connection
-    let console = match WingConsole::connect(host.as_deref()) {
-        Ok(conn) => std::sync::Arc::new(std::sync::Mutex::new(conn)),
-        Err(_) => return Err(rustler::Error::Term(Box::new("Failed to connect".to_string()))),
-    };
+/// Start the meter thread for a console connection.
+///
+/// Like start_reader_thread/2 this shares the console's existing connection —
+/// it requests the meters over the console's TCP socket (wsock) and reads the
+/// meter UDP socket, so it neither opens a second connection nor contends with
+/// the reader thread.
+///
+/// Every meter frame is forwarded to `pid` as {:wing_meter_data, values}: one
+/// flat list of i16 values (dB * 256, -32768 = -inf), 8 per meter, in the order
+/// the meters were requested.
+///
+/// Returns a handle for update_meter_thread/2 and stop_meter_thread/1. The
+/// thread also exits on its own when the owning pid is gone.
+#[rustler::nif]
+fn start_meter_thread(wing_arc: WingArc, pid_term: Term, meters_term: Term) -> NifResult<MeterArc> {
+    let pid: LocalPid = pid_term.decode()?;
+    let meters = decode_meters(meters_term)?;
+    let wing = wing_arc.wing.lock().unwrap().clone();
 
-    // Start thread to handle meter updates
+    let handle = ResourceArc::new(MeterHandle {
+        stop: AtomicBool::new(false),
+        wing,
+        pending: Mutex::new(Some(meters)),
+    });
+
+    let thread_handle = handle.clone();
     thread::spawn(move || {
-        // Request meter data
-        {
-            let mut wing = console.lock().unwrap();
-            if let Err(_) = wing.request_meter(&meters) {
-                return;
+        let mut wing = thread_handle.wing.clone();
+        // Only frames carrying the current meter id are forwarded: a superseded
+        // request keeps streaming for a few seconds after stop_meter(), and its
+        // values belong to a different meter set.
+        let mut current_id: Option<u16> = None;
+
+        loop {
+            if thread_handle.stop.load(Ordering::Acquire) {
+                break;
+            }
+
+            let pending = thread_handle.pending.lock().unwrap().take();
+            if let Some(meters) = pending {
+                match wing.request_meter(&meters) {
+                    Ok(id) => {
+                        if let Some(old) = current_id.replace(id) {
+                            wing.stop_meter(old);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            // Bounded wait so a stop request or a new meter set is picked up
+            // promptly even when the console has gone quiet.
+            match wing.read_meters_timeout(Duration::from_millis(250)) {
+                Ok(None) => continue,
+                Ok(Some((id, values))) => {
+                    // Drop frames for a superseded request, and everything from
+                    // the moment a new meter set was handed in: the owner
+                    // labels frames with the set it last asked for.
+                    if current_id != Some(id) || thread_handle.pending.lock().unwrap().is_some() {
+                        continue;
+                    }
+                    let msg: Vec<i32> = values.iter().map(|v| *v as i32).collect();
+                    let mut env = OwnedEnv::new();
+                    let sent = env.send_and_clear(&pid, |env| {
+                        (wing_meter_data(), msg).encode(env)
+                    });
+                    if sent.is_err() {
+                        // Owner process is gone — stop metering instead of
+                        // reading into the void forever.
+                        break;
+                    }
+                }
+                // The meter socket is dead (or the console connection is);
+                // there is nothing to recover here, the owner reconnects.
+                Err(_) => break,
             }
         }
 
-        loop {
-            let result = {
-                let mut wing = console.lock().unwrap();
-                wing.read_meters()
-            };
-
-            if let Ok((_id, values)) = result {
-                let msg: Vec<i32> = values.iter().map(|v| *v as i32).collect();
-                let mut env = OwnedEnv::new();
-                let _ = env.send_and_clear(&pid, |env| (rustler::types::atom::ok(), msg).encode(env));
-            }
+        // Let the console drop the subscription instead of streaming meter
+        // packets at a socket nobody reads any more.
+        if let Some(id) = current_id {
+            wing.stop_meter(id);
         }
     });
 
-    Ok(())
+    Ok(handle)
+}
+
+/// Replace the meter set a running meter thread requests. The thread picks the
+/// new set up within ~250ms, requests it, and retires the previous request.
+#[rustler::nif]
+fn update_meter_thread(handle: MeterArc, meters_term: Term) -> NifResult<rustler::types::atom::Atom> {
+    let meters = decode_meters(meters_term)?;
+    *handle.pending.lock().unwrap() = Some(meters);
+    Ok(rustler::types::atom::ok())
+}
+
+/// Stop a meter thread. The thread exits within ~250ms and retires its meter
+/// request; the console connection itself stays open (it is shared with the
+/// reader thread and with writes).
+#[rustler::nif]
+fn stop_meter_thread(handle: MeterArc) -> rustler::types::atom::Atom {
+    handle.stop.store(true, Ordering::Release);
+    rustler::types::atom::ok()
 }
 
 // Legacy per-property reader: spawns a thread with its OWN TCP connection per
