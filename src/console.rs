@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::{TcpStream, UdpSocket};
+use std::net::{TcpStream, ToSocketAddrs, UdpSocket};
 use std::io::{Read, Write};
 use std::time::Duration;
 use std::sync::{Mutex, Arc};
@@ -48,6 +48,9 @@ lazy_static::lazy_static! {
 const RX_BUFFER_SIZE: usize = 2048;
 const DATA_KEEP_ALIVE_SECONDS: u64 = 7;
 const METERS_KEEP_ALIVE_SECONDS: u64 = 3;
+// TcpStream::connect has no timeout and can block for the OS SYN timeout
+// (~75s on macOS) when the console is unreachable.
+const CONNECT_TIMEOUT_SECONDS: u64 = 5;
 
 #[derive(NifStruct)]
 #[module = "Wing.DiscoveryInfo"]
@@ -142,7 +145,11 @@ impl WingConsole {
                 }
             };
 
-        let mut stream = TcpStream::connect((ip, 2222))?;
+        let addr = (ip.as_str(), 2222)
+            .to_socket_addrs()?
+            .next()
+            .ok_or(Error::ConnectionError)?;
+        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(CONNECT_TIMEOUT_SECONDS))?;
         // stream.set_nonblocking(true)?;
         stream.set_nodelay(true)?;
         stream.write_all(&[0xdf, 0xd1])?;
